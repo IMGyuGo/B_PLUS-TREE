@@ -5,14 +5,14 @@
  * 금지   : 다른 팀원은 이 파일을 수정하지 않는다.
  *
  * 구현 체크리스트:
- *   [ ] index_init: data/{table}.dat 스캔 -> 두 트리 동시 구축
+ *   [x] index_init: data/{table}.dat 스캔 -> 두 트리 동시 구축
  *       - ftell()로 각 행의 시작 오프셋 기록
  *       - 첫 번째 컬럼(id)  파싱 -> tree_id  에 삽입
  *       - 세 번째 컬럼(age) 파싱 -> tree_age 에 삽입
- *   [ ] index_insert_id / index_search_id / index_range_id
- *   [ ] index_insert_age / index_range_age
- *   [ ] index_height_id / index_height_age
- *   [ ] index_cleanup: 모든 트리 해제
+ *   [x] index_insert_id / index_search_id / index_range_id
+ *   [x] index_insert_age / index_range_age
+ *   [x] index_height_id / index_height_age
+ *   [x] index_cleanup: 모든 트리 해제
  * ========================================================= */
 
 #include <stdio.h>
@@ -35,7 +35,11 @@ typedef struct {
 static TableIndex g_tables[IDX_MAX_TABLES];
 static int        g_count = 0;
 
-/* ── 내부 헬퍼: 테이블 이름으로 인덱스 레코드를 찾는다 ── */
+/* =========================================================
+ * 내부 헬퍼
+ * ========================================================= */
+
+/* 테이블 이름으로 인덱스 레코드를 찾는다 */
 static TableIndex *find_entry(const char *table) {
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_tables[i].table, table) == 0)
@@ -44,8 +48,47 @@ static TableIndex *find_entry(const char *table) {
     return NULL;
 }
 
+/*
+ * col_value — '|' 구분자 기준 n번째 컬럼 값을 buf에 복사한다.
+ *
+ * 데이터 파일 형식: "1 | alice | 25 | alice@example.com\n"
+ * n=0 -> "1", n=1 -> "alice", n=2 -> "25", ...
+ *
+ * 앞뒤 공백은 자동으로 제거한다.
+ * 반환: 1 성공, 0 실패 (컬럼 없음)
+ */
+static int col_value(const char *line, int n, char *buf, int buf_size) {
+    const char *p = line;
+    int col = 0;
+
+    /* n번째 컬럼 시작 위치까지 이동 */
+    while (*p && col < n) {
+        if (*p == '|') col++;
+        p++;
+    }
+    if (col < n) return 0;
+
+    /* 앞 공백 건너뜀 */
+    while (*p == ' ') p++;
+
+    /* '|', '\n', '\r', '\0' 전까지 복사 */
+    int i = 0;
+    while (*p && *p != '|' && *p != '\n' && *p != '\r' && i < buf_size - 1)
+        buf[i++] = *p++;
+
+    /* 뒤 공백 제거 */
+    while (i > 0 && buf[i - 1] == ' ') i--;
+    buf[i] = '\0';
+
+    return 1;
+}
+
 /* =========================================================
  * index_init
+ *
+ * 두 트리를 생성하고, data/{table}.dat 가 존재하면
+ * 전체를 스캔해 기존 데이터를 트리에 채운다.
+ * 파일이 없으면 빈 인덱스로 시작한다 (정상).
  * ========================================================= */
 int index_init(const char *table, int order_id, int order_age) {
     if (!table || g_count >= IDX_MAX_TABLES) return -1;
@@ -70,37 +113,53 @@ int index_init(const char *table, int order_id, int order_age) {
 
     g_count++;
 
-    /*
-     * TODO (김은재): data/{table}.dat 파일을 한 줄씩 읽어
-     *   두 트리를 구축한다.
-     *
-     *   구현 가이드:
-     *     char path[256];
-     *     snprintf(path, sizeof(path), "data/%s.dat", table);
-     *     FILE *fp = fopen(path, "rb");  <- binary mode (오프셋 정확도)
-     *     if (!fp) { ti->initialized = 1; return 0; }  <- 파일 없으면 빈 인덱스
-     *
-     *     char line[1024];
-     *     while (1) {
-     *         long offset = ftell(fp);       <- 이 행의 시작 오프셋
-     *         if (!fgets(line, sizeof(line), fp)) break;
-     *
-     *         int id  = atoi(col_value(line, 0));  <- 0번 컬럼 = id
-     *         int age = atoi(col_value(line, 2));  <- 2번 컬럼 = age
-     *
-     *         bptree_insert(ti->tree_id,  id,  offset);
-     *         bptree_insert(ti->tree_age, age, offset);
-     *     }
-     *     fclose(fp);
-     *
-     *   컬럼 파싱: '|' 구분자 기준 n번째 토큰을 반환하는
-     *             내부 헬퍼 함수(static)를 만들어 재사용한다.
-     */
+    /* ── .dat 파일 스캔 → 두 트리 구축 ──────────────────── */
+    char path[256];
+    snprintf(path, sizeof(path), "data/%s.dat", table);
+
+    FILE *fp = fopen(path, "rb");   /* binary mode: ftell 오프셋 정확도 */
+    if (!fp) {
+        /* 파일 없음 = 아직 INSERT 안 됨. 빈 인덱스로 시작. */
+        fprintf(stderr, "[index] '%s' 초기화 완료 (파일 없음, 빈 인덱스)\n",
+                table);
+        ti->initialized = 1;
+        return 0;
+    }
+
+    char line[1024];
+    char col_buf[64];
+    int  inserted = 0;
+
+    while (1) {
+        long offset = ftell(fp);            /* 이 행의 시작 오프셋 */
+        if (!fgets(line, sizeof(line), fp)) break;
+
+        /* 줄 끝 개행 제거 후 빈 줄 건너뜀 */
+        int len = (int)strlen(line);
+        while (len > 0 &&
+               (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+
+        /* id (컬럼 0) 파싱 */
+        if (!col_value(line, 0, col_buf, sizeof(col_buf))) continue;
+        int id = atoi(col_buf);
+
+        /* age (컬럼 2) 파싱 */
+        if (!col_value(line, 2, col_buf, sizeof(col_buf))) continue;
+        int age = atoi(col_buf);
+
+        bptree_insert(ti->tree_id,  id,  offset);
+        bptree_insert(ti->tree_age, age, offset);
+        inserted++;
+    }
+
+    fclose(fp);
 
     fprintf(stderr,
-            "[index] '%s' 초기화 (order_id=%d, order_age=%d) "
-            "— 스텁: 파일 스캔 미구현\n",
-            table, oid, oage);
+            "[index] '%s' 초기화 완료 — %d 행 로드 "
+            "(order_id=%d, order_age=%d)\n",
+            table, inserted, oid, oage);
 
     ti->initialized = 1;
     return 0;
