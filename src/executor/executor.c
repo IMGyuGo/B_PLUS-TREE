@@ -18,29 +18,29 @@
 /*
  * executor.c
  *
- * This module sits between the parsed SQL AST and the on-disk table files.
+ * 이 파일은 파서가 만든 AST와 실제 데이터 파일 사이를 이어 주는 실행기다.
  *
- * Main responsibilities:
- * 1. INSERT:
- *    - append one row to data/{table}.dat
- *    - remember the file offset
- *    - update id/age indexes with that offset
+ * 핵심 역할:
+ * 1. INSERT 실행
+ *    - data/{table}.dat 뒤에 새 row를 한 줄 추가한다.
+ *    - 그 row가 시작한 파일 offset을 기록한다.
+ *    - id / age 인덱스에 같은 offset을 넣는다.
  *
- * 2. SELECT:
- *    - decide whether the query can use an index path
- *    - fetch rows by file offset when an index path is chosen
- *    - fall back to a linear scan for everything else
+ * 2. SELECT 실행
+ *    - 어떤 WHERE 절이 인덱스를 탈 수 있는지 판정한다.
+ *    - 인덱스를 타면 offset을 받아 실제 row를 다시 읽는다.
+ *    - 인덱스를 못 타면 파일 전체를 선형 탐색한다.
  *
- * The executor intentionally keeps stdout/stderr separated:
- * - stdout: query result table
- * - stderr: timing / diagnostic logs
+ * 출력 규칙:
+ * - stdout: 결과 테이블
+ * - stderr: 시간 / 진단 로그
  */
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
 }
 
-/* Small local replacement for strdup to stay within plain C99. */
+/* C99 환경에서 strdup 대신 쓰는 간단한 문자열 복사 함수다. */
 static char *dup_string(const char *src) {
     if (!src) src = "";
 
@@ -52,7 +52,7 @@ static char *dup_string(const char *src) {
     return copy;
 }
 
-/* Safe fixed-size string copy helper used across executor code paths. */
+/* 고정 크기 버퍼에 안전하게 문자열을 복사할 때 쓰는 헬퍼다. */
 static void copy_text(char *dst, size_t size, const char *src) {
     if (!dst || size == 0) return;
     if (!src) src = "";
@@ -61,7 +61,7 @@ static void copy_text(char *dst, size_t size, const char *src) {
     dst[size - 1] = '\0';
 }
 
-/* Find the schema index for a column name such as "id" or "age". */
+/* 스키마에서 "id", "age" 같은 컬럼 이름의 위치를 찾는다. */
 static int find_column_index(const TableSchema *schema, const char *name) {
     if (!schema || !name) return -1;
 
@@ -74,11 +74,13 @@ static int find_column_index(const TableSchema *schema, const char *name) {
 }
 
 /*
- * Extract one column value from a serialized row line:
+ * 파일에 저장된 한 줄 row 문자열에서 특정 컬럼 값만 꺼낸다.
+ *
+ * 예:
  *   "1 | alice | 25 | alice@example.com"
  *
- * The executor uses this helper in linear scan mode, where it must inspect
- * plain file rows without help from the B+Tree.
+ * 선형 탐색 경로에서는 B+Tree 도움 없이 파일 줄을 직접 검사해야 하므로
+ * 이 헬퍼가 WHERE 조건 판정에 쓰인다.
  */
 static int line_column_value(const char *line, int col_idx,
                              char *buf, size_t buf_size) {
@@ -104,7 +106,7 @@ static int line_column_value(const char *line, int col_idx,
     return 1;
 }
 
-/* Build an empty ResultSet that still preserves output column metadata. */
+/* 결과 row는 비어 있어도 컬럼 정보는 살아 있는 빈 ResultSet을 만든다. */
 static ResultSet *make_empty_rs(const TableSchema *schema) {
     ResultSet *rs = (ResultSet *)calloc(1, sizeof(ResultSet));
     if (!rs) return NULL;
@@ -123,13 +125,13 @@ static ResultSet *make_empty_rs(const TableSchema *schema) {
 }
 
 /*
- * Equality-only matcher used by the linear path.
+ * 선형 탐색 경로에서 WHERE col = value 형태를 검사한다.
  *
- * Example:
+ * 예:
  *   SELECT * FROM users WHERE name = 'alice'
  *
- * The indexed path handles only the supported id/age patterns, so every other
- * predicate eventually comes through this helper.
+ * 현재 인덱스 경로는 id / age의 일부 패턴만 처리하므로,
+ * 나머지 단순 equality 조건은 결국 이 함수로 내려온다.
  */
 static int line_matches_where(const char *line, const SelectStmt *stmt,
                               const TableSchema *schema) {
@@ -158,12 +160,12 @@ static int line_matches_where(const char *line, const SelectStmt *stmt,
 }
 
 /*
- * Unified filter entry point for the linear scan.
+ * 선형 탐색용 통합 필터 진입점이다.
  *
- * This extends the old equality-only behavior so forced-linear execution can
- * also support:
- *   WHERE id BETWEEN ...
- *   WHERE age BETWEEN ...
+ * 이 함수 덕분에 강제 linear 실행에서도 아래 조건을 처리할 수 있다.
+ * - WHERE id BETWEEN ...
+ * - WHERE age BETWEEN ...
+ * - 기존 WHERE col = value
  */
 static int line_matches_filter(const char *line, const SelectStmt *stmt,
                                const TableSchema *schema) {
@@ -188,7 +190,7 @@ static int line_matches_filter(const char *line, const SelectStmt *stmt,
     return 1;
 }
 
-/* Parse one serialized data line into a Row structure. */
+/* 파일 한 줄을 Row 구조체 하나로 파싱한다. */
 static Row parse_line_to_row(const char *line, const TableSchema *schema) {
     Row row = {0};
     row.count = schema->column_count;
@@ -216,12 +218,12 @@ static Row parse_line_to_row(const char *line, const TableSchema *schema) {
 }
 
 /*
- * Read every matching row from an already opened table file.
+ * 이미 열린 테이블 파일에서 조건에 맞는 모든 row를 읽는다.
  *
- * This is the core of the linear fallback path:
- * - iterate the file top-to-bottom
- * - keep only rows that satisfy the WHERE clause
- * - return them as parsed Row objects
+ * 즉 선형 fallback의 핵심 구현이다.
+ * - 파일 처음부터 끝까지 읽고
+ * - WHERE 조건을 만족하는 줄만 남기고
+ * - Row 배열로 변환해 돌려준다.
  */
 static int read_rows(FILE *fp, const SelectStmt *stmt,
                      const TableSchema *schema, Row **rows_out) {
@@ -258,10 +260,10 @@ static int read_rows(FILE *fp, const SelectStmt *stmt,
 }
 
 /*
- * Convert raw Row arrays into the public ResultSet shape.
+ * 내부 Row 배열을 외부 공개용 ResultSet 형태로 바꾼다.
  *
- * SELECT * keeps every schema column in order.
- * SELECT a, b, c projects only the requested columns.
+ * - SELECT *      : 스키마 순서대로 전체 컬럼 유지
+ * - SELECT a,b,c  : 요청된 컬럼만 추려 낸다.
  */
 static ResultSet *build_resultset(Row *rows, int row_count,
                                   const SelectStmt *stmt,
@@ -347,10 +349,13 @@ static ResultSet *build_resultset(Row *rows, int row_count,
 }
 
 /*
- * Random-read one row by file offset.
+ * 파일 offset 하나를 기준으로 row 한 건을 랜덤 접근해 읽는다.
  *
- * This is used for point lookups such as WHERE id = 5000 after the id index
- * tells us exactly where the row lives inside data/{table}.dat.
+ * 예:
+ *   WHERE id = 5000
+ *
+ * id 인덱스가 정확한 offset을 알려 주면 executor는 이 함수로
+ * 그 위치에 바로 jump 해서 실제 row를 읽는다.
  */
 static ResultSet *fetch_by_offset(long offset, const SelectStmt *stmt,
                                   const TableSchema *schema) {
@@ -392,14 +397,14 @@ static ResultSet *fetch_by_offset(long offset, const SelectStmt *stmt,
 }
 
 /*
- * Random-read many rows by file offsets.
+ * 여러 개의 offset을 받아 해당 row들을 랜덤 접근으로 읽는다.
  *
- * Important nuance:
- * - the B+Tree only finds offsets quickly
- * - the executor still has to visit the table file again to fetch each row
+ * 중요한 점:
+ * - B+Tree는 offset을 빨리 찾는 역할까지만 한다.
+ * - 실제 row 내용은 executor가 다시 파일에 가서 읽어 와야 한다.
  *
- * This is why a secondary-index range query can still be slower than a linear
- * scan when the result set is large.
+ * 그래서 secondary index range query는 탐색은 빨라도,
+ * 결과 row가 많아지면 선형 탐색보다 느려질 수 있다.
  */
 static ResultSet *fetch_by_offsets(const long *offsets, int count,
                                    const SelectStmt *stmt,
@@ -438,7 +443,7 @@ static ResultSet *fetch_by_offsets(const long *offsets, int count,
     return build_resultset(rows, actual, stmt, schema);
 }
 
-/* Full file scan fallback for non-indexed predicates or forced-linear mode. */
+/* 인덱스를 못 타는 조건이나 강제 linear 모드에서 쓰는 전체 파일 스캔 경로다. */
 static ResultSet *linear_scan(const SelectStmt *stmt,
                               const TableSchema *schema) {
     char path[256];
@@ -455,7 +460,7 @@ static ResultSet *linear_scan(const SelectStmt *stmt,
     return build_resultset(rows, row_count, stmt, schema);
 }
 
-/* Fill the optional report object used by compare mode and test_perf. */
+/* compare 모드와 test_perf가 쓰는 실행 결과 요약 구조체를 채운다. */
 static void fill_exec_info(SelectExecInfo *info, const char *path,
                            double elapsed_ms, int tree_io, int row_count) {
     if (!info) return;
@@ -467,19 +472,21 @@ static void fill_exec_info(SelectExecInfo *info, const char *path,
 }
 
 /*
- * Internal SELECT engine shared by:
- * - normal CLI execution
+ * SELECT의 실제 본체 함수다.
+ *
+ * 아래 경로들이 모두 이 함수를 공유한다.
+ * - 일반 CLI 실행
  * - --force-linear
  * - --compare
- * - performance benchmarks
+ * - 성능 벤치마크
  *
- * Path selection policy:
- * - WHERE id = ?            -> index:id:eq
- * - WHERE id BETWEEN ? AND ? -> index:id:range
+ * 현재 경로 선택 규칙:
+ * - WHERE id = ?              -> index:id:eq
+ * - WHERE id BETWEEN ? AND ?  -> index:id:range
  * - WHERE age BETWEEN ? AND ? -> index:age:range
- * - everything else          -> linear
+ * - 그 외                     -> linear
  *
- * If force_linear is set, the function skips the index branches entirely.
+ * force_linear이 켜지면 인덱스 분기를 건너뛰고 바로 linear로 간다.
  */
 ResultSet *db_select_mode(const SelectStmt *stmt, const TableSchema *schema,
                           int force_linear, int emit_log,
@@ -491,7 +498,7 @@ ResultSet *db_select_mode(const SelectStmt *stmt, const TableSchema *schema,
     int tree_io = 0;
     ResultSet *rs = NULL;
 
-    /* id predicates get the most direct point/range index paths. */
+    /* id 조건은 단건 / 범위 둘 다 가장 직접적인 인덱스 경로를 탈 수 있다. */
     if (!force_linear && stmt->has_where && strcmp(stmt->where.col, "id") == 0) {
         if (stmt->where.type == WHERE_EQ) {
             scan_type = "index:id:eq";
@@ -513,7 +520,7 @@ ResultSet *db_select_mode(const SelectStmt *stmt, const TableSchema *schema,
             rs = fetch_by_offsets(offsets, count, stmt, schema);
             free(offsets);
         }
-    /* age currently supports range lookup only. */
+    /* age는 현재 범위 조회만 인덱스로 지원한다. */
     } else if (!force_linear && stmt->has_where &&
                strcmp(stmt->where.col, "age") == 0 &&
                stmt->where.type == WHERE_BETWEEN) {
@@ -530,11 +537,12 @@ ResultSet *db_select_mode(const SelectStmt *stmt, const TableSchema *schema,
     }
 
     /*
-     * Any unsupported predicate shape falls back here.
-     * That includes examples such as:
-     *   WHERE name = 'alice'
-     *   WHERE email = '...'
-     *   forced linear benchmarking / comparison runs
+     * 지원하지 않는 WHERE 형태는 모두 여기로 떨어진다.
+     *
+     * 예:
+     * - WHERE name = 'alice'
+     * - WHERE email = '...'
+     * - 강제 linear 비교 / 벤치 실행
      */
     if (!rs) {
         scan_type = "linear";
@@ -558,27 +566,27 @@ ResultSet *db_select_mode(const SelectStmt *stmt, const TableSchema *schema,
     return rs;
 }
 
-/* Public SELECT entry used by the normal executor contract. */
+/* 일반 executor 계약에서 쓰는 공개 SELECT 진입점이다. */
 ResultSet *db_select(const SelectStmt *stmt, const TableSchema *schema) {
     return db_select_mode(stmt, schema, 0, 1, NULL);
 }
 
-/* Quiet SELECT entry used only by benchmarks. */
+/* 벤치마크에서만 쓰는 조용한 SELECT 진입점이다. */
 ResultSet *db_select_bench(const SelectStmt *stmt, const TableSchema *schema,
                            int force_linear) {
     return db_select_mode(stmt, schema, force_linear, 0, NULL);
 }
 
 /*
- * INSERT one row into the table file and immediately index it.
+ * row 한 건을 테이블 파일에 추가하고 즉시 인덱스에도 반영한다.
  *
- * The critical ordering is:
- * 1. open in binary append mode
- * 2. capture ftell() before writing
- * 3. write the serialized row
- * 4. insert that offset into id/age indexes
+ * 중요한 순서:
+ * 1. binary append 모드로 파일을 연다.
+ * 2. 쓰기 전에 ftell()로 시작 offset을 잡는다.
+ * 3. row를 한 줄로 기록한다.
+ * 4. 그 offset을 id / age 인덱스에 넣는다.
  *
- * That offset becomes the row's "pointer" for later indexed SELECTs.
+ * 나중에 인덱스 SELECT는 이 offset을 row의 "주소"처럼 사용한다.
  */
 int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
     MKDIR("data");
@@ -594,7 +602,7 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
 
     long offset = ftell(fp);
 
-    /* No explicit column list: values already match schema order. */
+    /* 컬럼 목록이 없으면 입력 값 순서가 이미 스키마 순서라고 본다. */
     if (stmt->column_count == 0) {
         for (int i = 0; i < stmt->value_count; i++) {
             fprintf(fp, "%s", stmt->values[i]);
@@ -602,8 +610,8 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
         }
     } else {
         /*
-         * Explicit column list: rebuild the stored row in schema order so the
-         * data file layout stays stable regardless of INSERT column order.
+         * 컬럼 목록이 있는 INSERT라면, 실제 파일에는 항상 스키마 순서대로 다시 써 준다.
+         * 그래야 INSERT 컬럼 순서가 달라도 data 파일 레이아웃이 흔들리지 않는다.
          */
         for (int s = 0; s < schema->column_count; s++) {
             int val_idx = -1;
@@ -631,7 +639,7 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
     const char *id_val = NULL;
     const char *age_val = NULL;
 
-    /* Resolve id/age from either full-row INSERT or column-list INSERT. */
+    /* id / age 값은 두 가지 INSERT 형태 모두에서 찾아낼 수 있어야 한다. */
     if (stmt->column_count == 0) {
         if (id_col >= 0 && id_col < stmt->value_count)
             id_val = stmt->values[id_col];
@@ -648,7 +656,7 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
         int id = atoi(id_val);
         int age = age_val ? atoi(age_val) : -1;
 
-        /* The table file is the source of truth; indexes are secondary paths. */
+        /* 실제 원본은 테이블 파일이고, 인덱스는 그 파일을 빠르게 찾기 위한 보조 경로다. */
         index_insert_id(stmt->table, id, offset);
         if (age >= 0)
             index_insert_age(stmt->table, age, offset);
@@ -657,7 +665,7 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
     return SQL_OK;
 }
 
-/* Small dispatcher kept for interface compatibility. */
+/* 기존 인터페이스 호환을 위해 남겨 둔 작은 디스패처다. */
 int executor_run(const ASTNode *node, const TableSchema *schema) {
     if (!node || !schema) return SQL_ERR;
 
@@ -680,7 +688,7 @@ int executor_run(const ASTNode *node, const TableSchema *schema) {
     }
 }
 
-/* Release every heap allocation owned by a ResultSet. */
+/* ResultSet이 들고 있는 모든 heap 메모리를 해제한다. */
 void result_free(ResultSet *rs) {
     if (!rs) return;
 

@@ -13,17 +13,19 @@
 /*
  * test_perf.c
  *
- * This benchmark intentionally measures the same logical query at two layers:
+ * 이 벤치는 같은 논리 쿼리를 두 층위에서 따로 측정한다.
  *
- * 1. Raw layer:
- *    compare index APIs against a hand-written linear file scan
+ * 1. Raw 층위:
+ *    - 인덱스 API 자체
+ *    - 직접 구현한 선형 파일 스캔
  *
- * 2. Executor layer:
- *    compare the real db_select() index path against forced linear execution
+ * 2. Executor 층위:
+ *    - 실제 db_select() 인덱스 경로
+ *    - 강제 linear 실행
  *
- * That split is useful because it tells us whether the cost comes from:
- * - the tree lookup itself
- * - or the later row-fetch / ResultSet-building work inside the executor
+ * 이렇게 나누는 이유는 비용이 어디서 생기는지 분리해서 보기 위해서다.
+ * - 트리 탐색 자체가 느린지
+ * - 아니면 이후 row fetch / ResultSet 생성이 느린지
  */
 
 typedef enum {
@@ -32,7 +34,7 @@ typedef enum {
     TREE_AGE = 1
 } TreeKind;
 
-/* One benchmark result row shown in the final report. */
+/* 최종 리포트에 찍히는 벤치 결과 한 줄이다. */
 typedef struct {
     double avg_ms;
     int    rows;
@@ -44,7 +46,7 @@ static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
 }
 
-/* Tiny safe copy helper used when initializing synthetic SelectStmt values. */
+/* 테스트용 SelectStmt를 만들 때 쓰는 작은 안전 복사 헬퍼다. */
 static void copy_text(char *dst, size_t size, const char *src) {
     if (!dst || size == 0) return;
     if (!src) src = "";
@@ -53,12 +55,12 @@ static void copy_text(char *dst, size_t size, const char *src) {
     dst[size - 1] = '\0';
 }
 
-/* Build data/{table}.dat. */
+/* data/{table}.dat 경로를 만든다. */
 static void build_data_path(char *buf, size_t size, const char *table) {
     snprintf(buf, size, "data/%s.dat", table);
 }
 
-/* Benchmark setup expects the data file to already exist. */
+/* 벤치 실행 전에는 data 파일이 이미 준비되어 있어야 한다. */
 static int data_file_exists(const char *table) {
     char path[256];
     build_data_path(path, sizeof(path), table);
@@ -69,7 +71,7 @@ static int data_file_exists(const char *table) {
     return 1;
 }
 
-/* Find a schema column index by name. */
+/* 컬럼 이름으로 스키마 내 위치를 찾는다. */
 static int find_column_index(const TableSchema *schema, const char *name) {
     if (!schema || !name) return -1;
 
@@ -81,8 +83,10 @@ static int find_column_index(const TableSchema *schema, const char *name) {
 }
 
 /*
- * Extract one column value from a serialized row line without building a full
- * Row/ResultSet object. The raw linear benchmark uses this to stay lightweight.
+ * 파일 한 줄에서 특정 컬럼 값만 꺼낸다.
+ *
+ * Raw linear 벤치는 ResultSet까지 만들 필요가 없으므로,
+ * 가볍게 조건 판정만 하기 위해 이 함수를 사용한다.
  */
 static int extract_column_value(const char *line, int col_idx,
                                 char *buf, size_t buf_size) {
@@ -106,7 +110,7 @@ static int extract_column_value(const char *line, int col_idx,
     return 1;
 }
 
-/* Predicate evaluator for the raw linear benchmark path. */
+/* Raw linear 벤치에서 쓰는 WHERE 조건 판정기다. */
 static int raw_line_matches(const char *line, const SelectStmt *stmt,
                             const TableSchema *schema) {
     if (!stmt->has_where) return 1;
@@ -132,7 +136,7 @@ static int raw_line_matches(const char *line, const SelectStmt *stmt,
     return 1;
 }
 
-/* Reuse schema validation instead of duplicating query-shape rules here. */
+/* 쿼리 형태 검증 규칙을 여기서 다시 쓰지 않고 schema_validate를 재사용한다. */
 static int validate_select_stmt(const SelectStmt *stmt,
                                 const TableSchema *schema) {
     ASTNode node;
@@ -142,7 +146,7 @@ static int validate_select_stmt(const SelectStmt *stmt,
     return schema_validate(&node, schema);
 }
 
-/* Build a simple SELECT * ... WHERE col = value statement in memory. */
+/* 메모리 안에서 SELECT * ... WHERE col = value 형태를 만든다. */
 static void init_select_eq(SelectStmt *stmt, const char *table,
                            const char *col, const char *value) {
     memset(stmt, 0, sizeof(*stmt));
@@ -154,7 +158,7 @@ static void init_select_eq(SelectStmt *stmt, const char *table,
     copy_text(stmt->where.val, sizeof(stmt->where.val), value);
 }
 
-/* Build a simple SELECT * ... WHERE col BETWEEN from AND to statement. */
+/* 메모리 안에서 SELECT * ... WHERE col BETWEEN from AND to 형태를 만든다. */
 static void init_select_between(SelectStmt *stmt, const char *table,
                                 const char *col,
                                 const char *from, const char *to) {
@@ -168,14 +172,14 @@ static void init_select_between(SelectStmt *stmt, const char *table,
     copy_text(stmt->where.val_to, sizeof(stmt->where.val_to), to);
 }
 
-/* Map benchmark labels to the right tree height query. */
+/* 벤치 대상 종류에 맞는 트리 높이 조회 함수를 연결한다. */
 static int tree_height(const char *table, TreeKind kind) {
     if (kind == TREE_ID) return index_height_id(table);
     if (kind == TREE_AGE) return index_height_age(table);
     return -1;
 }
 
-/* Pretty-print one benchmark result row. */
+/* 벤치 결과 한 줄을 보기 좋게 출력한다. */
 static void print_result_row(const char *label, const BenchResult *result) {
     char tree_buf[32];
 
@@ -189,8 +193,8 @@ static void print_result_row(const char *label, const BenchResult *result) {
 }
 
 /*
- * Print a ratio only when both paths returned the same number of rows.
- * If the row counts differ, the mismatch itself is the important signal.
+ * 두 경로가 같은 row 수를 돌려줬을 때만 speedup 비율을 출력한다.
+ * row 수가 다르면 성능보다 정합성 차이가 더 중요하므로 mismatch를 출력한다.
  */
 static void print_speedup_or_mismatch(const char *label,
                                       const BenchResult *index_result,
@@ -217,11 +221,11 @@ static void print_separator(void) {
 }
 
 /*
- * Raw linear baseline:
- * scan the data file directly and count matching rows.
+ * Raw linear 기준선:
+ * data 파일을 직접 처음부터 끝까지 읽으며 조건에 맞는 row 수만 센다.
  *
- * This deliberately does not build a ResultSet because the goal here is to
- * compare raw lookup/filter work against raw index lookup work.
+ * 여기서는 일부러 ResultSet을 만들지 않는다.
+ * 목적이 "순수 탐색 / 필터 비용"을 인덱스 API와 비교하는 것이기 때문이다.
  */
 static int raw_scan_count(const char *table, const SelectStmt *stmt,
                           const TableSchema *schema, int *rows_out) {
@@ -243,7 +247,7 @@ static int raw_scan_count(const char *table, const SelectStmt *stmt,
     return SQL_OK;
 }
 
-/* Measure the raw full-scan baseline. */
+/* Raw 전체 스캔 기준선을 측정한다. */
 static int measure_raw_linear(const char *table, const SelectStmt *stmt,
                               const TableSchema *schema, BenchResult *out) {
     double total = 0.0;
@@ -263,7 +267,7 @@ static int measure_raw_linear(const char *table, const SelectStmt *stmt,
     return SQL_OK;
 }
 
-/* Measure only the raw id point lookup cost through the index API. */
+/* id point lookup의 순수 인덱스 API 비용만 측정한다. */
 static int measure_raw_id_point(const char *table, int target_id,
                                 BenchResult *out) {
     double total = 0.0;
@@ -283,7 +287,7 @@ static int measure_raw_id_point(const char *table, int target_id,
     return SQL_OK;
 }
 
-/* Measure only the raw id range lookup cost through the index API. */
+/* id range lookup의 순수 인덱스 API 비용만 측정한다. */
 static int measure_raw_id_range(const char *table, int from, int to,
                                 BenchResult *out) {
     double total = 0.0;
@@ -306,7 +310,7 @@ static int measure_raw_id_range(const char *table, int from, int to,
     return SQL_OK;
 }
 
-/* Measure only the raw age range lookup cost through the index API. */
+/* age range lookup의 순수 인덱스 API 비용만 측정한다. */
 static int measure_raw_age_range(const char *table, int from, int to,
                                  BenchResult *out) {
     double total = 0.0;
@@ -330,13 +334,13 @@ static int measure_raw_age_range(const char *table, int from, int to,
 }
 
 /*
- * Measure the full executor path:
- * - path selection
- * - offset fetches
- * - row parsing
- * - ResultSet creation
+ * executor 전체 경로를 측정한다.
+ * - 경로 선택
+ * - offset fetch
+ * - row 파싱
+ * - ResultSet 생성
  *
- * This is what users actually feel when they run sqlp.
+ * 즉 사용자가 sqlp를 실행할 때 실제로 체감하는 비용에 더 가깝다.
  */
 static int measure_executor_select(const SelectStmt *stmt,
                                    const TableSchema *schema,
@@ -366,7 +370,7 @@ static int measure_executor_select(const SelectStmt *stmt,
     return SQL_OK;
 }
 
-/* Test 1: point lookup on id. */
+/* 1번 테스트: id 단건 조회 비교 */
 static int bench_point_search(const char *table, const TableSchema *schema,
                               int target_id) {
     char id_buf[32];
@@ -399,7 +403,7 @@ static int bench_point_search(const char *table, const TableSchema *schema,
     return SQL_OK;
 }
 
-/* Test 2: id range lookup. */
+/* 2번 테스트: id 범위 조회 비교 */
 static int bench_id_range_search(const char *table, const TableSchema *schema,
                                  int from, int to) {
     char from_buf[32];
@@ -435,7 +439,7 @@ static int bench_id_range_search(const char *table, const TableSchema *schema,
     return SQL_OK;
 }
 
-/* Test 3: age range lookup. This is where large-result secondary-index costs show up. */
+/* 3번 테스트: age 범위 조회 비교. 결과가 많을 때 보조 인덱스 비용이 드러나는 구간이다. */
 static int bench_age_range_search(const char *table, const TableSchema *schema,
                                   int from, int to) {
     char from_buf[32];
@@ -471,18 +475,18 @@ static int bench_age_range_search(const char *table, const TableSchema *schema,
     return SQL_OK;
 }
 
-/* Rebuild both trees with the same order for the height comparison test. */
+/* 높이 비교 테스트를 위해 두 트리를 같은 order로 다시 만든다. */
 static int init_index_for_order(const char *table, int order) {
     index_cleanup();
     return index_init(table, order, order);
 }
 
 /*
- * Test 4: compare a very small order against the default order.
+ * 4번 테스트: 아주 작은 order와 기본 order를 비교한다.
  *
- * The point of this test is not "realistic production tuning". It is a way to
- * exaggerate the tree height difference so we can observe how extra node visits
- * change time and tree_io.
+ * 이 테스트의 목적은 "실서비스 튜닝"이 아니라,
+ * 트리 높이 차이를 일부러 크게 만들어서
+ * 추가 노드 방문이 시간과 tree_io에 어떤 영향을 주는지 보기 위함이다.
  */
 static int bench_height_comparison(const char *table, const TableSchema *schema,
                                    int target_id) {
@@ -526,7 +530,7 @@ int main(int argc, char *argv[]) {
     int rows = (argc > 2) ? atoi(argv[2]) : 1000000;
     TableSchema *schema = NULL;
 
-    /* The CLI accepts a table name and the expected row count used in labels. */
+    /* CLI 인자는 테이블 이름과, 출력 라벨에 쓸 예상 row 수다. */
     printf("============================================================\n");
     printf("  B+ Tree Performance Benchmark\n");
     printf("  Table: %s  |  Rows: %d\n", table, rows);
@@ -544,8 +548,8 @@ int main(int argc, char *argv[]) {
     }
 
     /*
-     * test_perf does not auto-load data on purpose.
-     * We want the benchmark step to measure queries only, not data preparation.
+     * test_perf는 일부러 데이터를 자동 적재하지 않는다.
+     * 벤치 단계에서 측정하고 싶은 것은 데이터 준비가 아니라 조회 비용이기 때문이다.
      */
     if (!data_file_exists(table)) {
         fprintf(stderr, "benchmark data missing for '%s'.\n", table);
@@ -566,7 +570,7 @@ int main(int argc, char *argv[]) {
     printf("  tree_h(id)=%d  tree_h(age)=%d\n",
            index_height_id(table), index_height_age(table));
 
-    /* The four sections below form the full first-stage benchmark report. */
+    /* 아래 네 섹션이 현재 1차 성능 리포트 전체를 이룬다. */
     if (bench_point_search(table, schema, rows / 2) != SQL_OK ||
         bench_id_range_search(table, schema, rows / 4, rows / 2) != SQL_OK ||
         bench_age_range_search(table, schema, 30, 40) != SQL_OK ||

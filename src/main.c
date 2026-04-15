@@ -9,11 +9,16 @@
 /*
  * main.c
  *
- * CLI entry point for sqlp / sqlp_sim.
+ * sqlp / sqlp_sim의 CLI 진입점이다.
  *
- * The program reads one SQL file, tokenizes the whole file, splits it into
- * statements, and executes them one by one. For SELECT statements it can run
- * in normal mode, forced-linear mode, or compare mode.
+ * 전체 흐름:
+ * 1. 명령행 옵션을 읽는다.
+ * 2. SQL 파일을 통째로 읽는다.
+ * 3. 전체를 토큰화한다.
+ * 4. 세미콜론 기준으로 statement를 나눈다.
+ * 5. statement마다 파싱 / 검증 / 실행을 수행한다.
+ *
+ * SELECT는 일반 모드, 강제 linear 모드, compare 모드로 실행될 수 있다.
  */
 
 typedef enum {
@@ -22,7 +27,7 @@ typedef enum {
     RUN_MODE_COMPARE = 2
 } RunMode;
 
-/* Render a ResultSet in a compact SQL-client style table. */
+/* ResultSet을 간단한 SQL 클라이언트 스타일 표로 출력한다. */
 static void print_pretty_table(ResultSet *rs) {
     if (!rs || rs->row_count == 0) {
         printf("(0 rows)\n");
@@ -68,8 +73,8 @@ static void print_pretty_table(ResultSet *rs) {
 }
 
 /*
- * The lexer tokenizes the entire SQL file at once.
- * This helper rebuilds a per-statement token list using ';' as the boundary.
+ * lexer는 SQL 파일 전체를 한 번에 토큰화한다.
+ * 이 함수는 그 토큰 목록을 ';' 기준으로 다시 한 statement씩 잘라 준다.
  */
 static TokenList *split_tokens(const TokenList *all, int start,
                                int *next_start) {
@@ -112,8 +117,11 @@ static TokenList *split_tokens(const TokenList *all, int start,
 }
 
 /*
- * Compare mode keeps result tables on stdout and emits only one compact timing
- * summary line on stderr so it is easy to redirect or diff.
+ * compare 모드에서는 결과 테이블은 stdout에 두고,
+ * 비교 요약은 stderr 한 줄로만 출력한다.
+ *
+ * 이렇게 해 두면 화면으로 비교하기도 쉽고,
+ * stdout / stderr를 따로 리다이렉션하기도 좋다.
  */
 static void print_compare_summary(const SelectExecInfo *auto_info,
                                   const SelectExecInfo *linear_info) {
@@ -145,14 +153,13 @@ static void print_compare_summary(const SelectExecInfo *auto_info,
 }
 
 /*
- * Execute one SELECT according to the chosen CLI mode.
+ * SELECT 하나를 현재 CLI 모드에 맞춰 실행한다.
  *
- * RUN_MODE_COMPARE intentionally runs the same query twice:
- * - auto path selection
+ * RUN_MODE_COMPARE는 같은 쿼리를 일부러 두 번 돌린다.
+ * - auto 경로 선택
  * - forced linear fallback
  *
- * That makes it easy to compare both the result table and timing behavior
- * using a single command.
+ * 그래서 명령 하나만으로 결과 테이블과 시간 차이를 함께 볼 수 있다.
  */
 static int run_select(const SelectStmt *stmt, const TableSchema *schema,
                       RunMode mode) {
@@ -168,7 +175,7 @@ static int run_select(const SelectStmt *stmt, const TableSchema *schema,
             return SQL_ERR;
         }
 
-        /* Keep the output order fixed so compare mode is predictable. */
+        /* compare 모드의 출력 순서는 항상 auto -> linear로 고정한다. */
         printf("[AUTO RESULT]\n");
         print_pretty_table(auto_rs);
         printf("[LINEAR RESULT]\n");
@@ -190,10 +197,10 @@ static int run_select(const SelectStmt *stmt, const TableSchema *schema,
 }
 
 /*
- * Parse, validate, and execute exactly one SQL statement.
+ * SQL statement 하나를 파싱, 검증, 실행한다.
  *
- * Even though the input file can contain multiple statements, this function
- * works on one logical statement at a time.
+ * 입력 파일에는 여러 statement가 있을 수 있지만,
+ * 이 함수는 논리적 statement 하나만 처리한다.
  */
 static int run_statement(TokenList *tokens, RunMode mode) {
     ASTNode *ast = parser_parse(tokens);
@@ -206,7 +213,7 @@ static int run_statement(TokenList *tokens, RunMode mode) {
                         ? ast->select.table
                         : ast->insert.table;
 
-    /* The schema drives both validation and result formatting. */
+    /* 스키마는 검증 기준이면서 결과 테이블 컬럼 구성 기준이기도 하다. */
     TableSchema *schema = schema_load(table);
     if (!schema) {
         fprintf(stderr, "Error: schema not found for table '%s'\n", table);
@@ -222,8 +229,8 @@ static int run_statement(TokenList *tokens, RunMode mode) {
     }
 
     /*
-     * index_init() is idempotent for a table, so this call is safe even when
-     * multiple statements in the same file touch the same table.
+     * index_init()는 같은 테이블에 대해 멱등적으로 동작하므로,
+     * 한 파일 안에서 같은 테이블을 여러 statement가 써도 안전하다.
      */
     if (index_init(table, IDX_ORDER_DEFAULT, IDX_ORDER_DEFAULT) != 0) {
         fprintf(stderr, "Error: index_init failed for table '%s'\n", table);
@@ -251,7 +258,7 @@ static int run_statement(TokenList *tokens, RunMode mode) {
     return status;
 }
 
-/* Centralized usage text for option parsing errors. */
+/* 옵션 파싱 에러에서 공통으로 쓰는 usage 출력이다. */
 static void print_usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [--force-linear | --compare] <sql_file>\n", argv0);
 }
@@ -262,7 +269,7 @@ int main(int argc, char *argv[]) {
     const char *sql_path = NULL;
 
     /*
-     * Supported forms:
+     * 지원 형태:
      *   ./sqlp file.sql
      *   ./sqlp --force-linear file.sql
      *   ./sqlp --compare file.sql
@@ -288,7 +295,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* The two execution modifiers are intentionally exclusive. */
+    /* --force-linear 과 --compare 는 일부러 동시에 못 쓰게 막아 둔다. */
     RunMode mode = RUN_MODE_AUTO;
     if (compare) mode = RUN_MODE_COMPARE;
     else if (force_linear) mode = RUN_MODE_FORCE_LINEAR;
@@ -299,7 +306,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Tokenize first, then split the file into statements below. */
+    /* 먼저 파일 전체를 토큰화하고, 아래에서 statement 단위로 다시 나눈다. */
     TokenList *all_tokens = lexer_tokenize(sql);
     free(sql);
     if (!all_tokens) {
@@ -311,7 +318,7 @@ int main(int argc, char *argv[]) {
     int fail = 0;
     int pos = 0;
 
-    /* Walk the token stream statement-by-statement. */
+    /* 전체 토큰 목록을 statement 단위로 순회한다. */
     while (pos < all_tokens->count) {
         if (all_tokens->tokens[pos].type == TOKEN_EOF) break;
 
@@ -327,14 +334,14 @@ int main(int argc, char *argv[]) {
 
     lexer_free(all_tokens);
 
-    /* Only print a summary when the file contained multiple statements. */
+    /* 여러 statement가 있었을 때만 요약 문구를 따로 출력한다. */
     if (total > 1) {
         printf("\n%d statement(s) executed", total);
         if (fail > 0) printf(", %d failed", fail);
         printf(".\n");
     }
 
-    /* Release every in-memory table index built during execution. */
+    /* 실행 중 만들어 둔 메모리 인덱스를 모두 정리한다. */
     index_cleanup();
     return fail > 0 ? 1 : 0;
 }

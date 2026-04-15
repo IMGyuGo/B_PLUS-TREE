@@ -4,15 +4,36 @@
 
 #include "../../include/bptree.h"
 
+/*
+ * bptree.c
+ *
+ * 이 구현은 두 인덱스가 공통으로 사용하는 B+Tree 본체다.
+ * - id 트리:  키=id,  값=file offset
+ * - age 트리: 키=age, 값=file offset
+ *
+ * age는 중복 키가 가능하므로, 리프 엔트리 하나가 여러 offset을
+ * 들고 있을 수 있다.
+ *
+ * 추가로 sim 빌드에서는 노드 방문마다 "페이지 1번 읽기"에 해당하는
+ * 시뮬레이션을 수행하고, 마지막 조회의 방문 횟수를 tree_io처럼 기록한다.
+ */
+
 #define IO_PAGE_SIZE 4096
 #define IO_SIM_PAGES 256
 
+/* 같은 키에 매달린 여러 offset 목록이다. age 인덱스에서 특히 중요하다. */
 typedef struct BPValueList {
     long *offsets;
     int   count;
     int   capacity;
 } BPValueList;
 
+/*
+ * B+Tree 노드 구조.
+ * - 리프 노드면 values[] 사용
+ * - 내부 노드면 children[] 사용
+ * - 리프끼리는 next/prev로 이어서 범위 탐색을 빠르게 한다.
+ */
 typedef struct BPNode {
     int is_leaf;
     int key_count;
@@ -25,12 +46,14 @@ typedef struct BPNode {
     struct BPNode *prev;
 } BPNode;
 
+/* 삽입 재귀 도중 자식 분할 결과를 부모에게 전달할 때 쓰는 구조체다. */
 typedef struct {
     int     did_split;
     int     promoted_key;
     BPNode *right;
 } BPSplitResult;
 
+/* range 결과 offset들을 동적으로 쌓아 두는 버퍼다. */
 typedef struct {
     long *offsets;
     int   count;
@@ -49,6 +72,11 @@ static FILE *g_sim_file = NULL;
 static long  g_sim_page_cursor = 0;
 static int   g_sim_ready = 0;
 
+/*
+ * sim 모드에서 재사용할 임시 파일을 한 번만 준비한다.
+ * 매 노드 방문 때마다 open/close 하지 않고, 이미 열린 파일에서
+ * 고정 크기 페이지를 read 하도록 만들기 위한 준비 단계다.
+ */
 static int sim_ensure_file(void) {
     if (g_sim_ready) return g_sim_file != NULL;
 
@@ -72,6 +100,7 @@ static int sim_ensure_file(void) {
 }
 #endif
 
+/* sim 모드에서 페이지 하나를 읽었다고 가정하는 작은 읽기 동작이다. */
 static void sim_page_read(void) {
 #if BPTREE_SIMULATE_IO
     unsigned char page[IO_PAGE_SIZE];
@@ -86,12 +115,14 @@ static void sim_page_read(void) {
 #endif
 }
 
+/* 노드 방문 1회를 기록하고, sim 모드면 페이지 read도 함께 수행한다. */
 static void record_node_visit(BPTree *tree) {
     if (!tree) return;
     tree->last_io_count++;
     sim_page_read();
 }
 
+/* offset 하나로 시작하는 값 목록을 만든다. */
 static BPValueList *valuelist_create(long offset) {
     BPValueList *list = (BPValueList *)calloc(1, sizeof(BPValueList));
     if (!list) return NULL;
@@ -108,12 +139,14 @@ static BPValueList *valuelist_create(long offset) {
     return list;
 }
 
+/* 값 목록 메모리를 정리한다. */
 static void valuelist_destroy(BPValueList *list) {
     if (!list) return;
     free(list->offsets);
     free(list);
 }
 
+/* 같은 키 내부에서는 offset 오름차순이 유지되도록 삽입한다. */
 static int valuelist_insert_sorted(BPValueList *list, long offset) {
     int insert_at = 0;
 
@@ -139,6 +172,7 @@ static int valuelist_insert_sorted(BPValueList *list, long offset) {
     return 0;
 }
 
+/* 되돌리기 처리 등에 쓰기 위해 값 목록에서 offset 하나를 제거한다. */
 static int valuelist_remove_one(BPValueList *list, long offset) {
     int remove_at = -1;
 
@@ -160,6 +194,7 @@ static int valuelist_remove_one(BPValueList *list, long offset) {
     return 0;
 }
 
+/* 리프 / 내부 노드 여부에 맞는 새 노드를 만든다. */
 static BPNode *bpnode_create(int order, int is_leaf) {
     BPNode *node = (BPNode *)calloc(1, sizeof(BPNode));
     if (!node) return NULL;
@@ -192,6 +227,7 @@ static BPNode *bpnode_create(int order, int is_leaf) {
     return node;
 }
 
+/* 노드 이하의 모든 메모리를 재귀적으로 해제한다. */
 static void bpnode_destroy(BPNode *node) {
     if (!node) return;
 
@@ -209,10 +245,12 @@ static void bpnode_destroy(BPNode *node) {
     free(node);
 }
 
+/* 한 노드에 들어갈 수 있는 최대 key 수는 order - 1 이다. */
 static int max_keys(const BPTree *tree) {
     return tree->order - 1;
 }
 
+/* 내부 노드에서 키가 내려가야 할 자식 위치를 찾는다. */
 static int internal_child_index(const BPNode *node, int key) {
     int idx = 0;
     while (idx < node->key_count && key >= node->keys[idx])
@@ -220,6 +258,7 @@ static int internal_child_index(const BPNode *node, int key) {
     return idx;
 }
 
+/* 리프에서 키가 들어갈 첫 위치를 찾는다. */
 static int leaf_lower_bound(const BPNode *leaf, int key) {
     int lo = 0;
     int hi = leaf->key_count;
@@ -235,6 +274,7 @@ static int leaf_lower_bound(const BPNode *leaf, int key) {
     return lo;
 }
 
+/* 리프가 넘쳤을 때 오른쪽 리프로 반을 나누고 연결도 유지한다. */
 static void split_leaf_into_right(BPNode *leaf,
                                   BPNode *right,
                                   BPSplitResult *result) {
@@ -261,6 +301,7 @@ static void split_leaf_into_right(BPNode *leaf,
     result->right = right;
 }
 
+/* 내부 노드가 넘쳤을 때 가운데 키를 올리고 오른쪽 노드를 만든다. */
 static void split_internal_into_right(BPNode *node,
                                       BPNode *right,
                                       BPSplitResult *result) {
@@ -286,6 +327,7 @@ static void split_internal_into_right(BPNode *node,
     result->right = right;
 }
 
+/* 리프 분할 도중 상위 단계에서 실패하면 원래 상태로 되돌린다. */
 static void rollback_leaf_split(BPNode *left, BPNode *right) {
     int base = left->key_count;
 
@@ -302,6 +344,7 @@ static void rollback_leaf_split(BPNode *left, BPNode *right) {
     bpnode_destroy(right);
 }
 
+/* 내부 노드 분할 도중 상위 단계에서 실패하면 원래 상태로 되돌린다. */
 static void rollback_internal_split(BPNode *left,
                                     int promoted_key,
                                     BPNode *right) {
@@ -321,6 +364,7 @@ static void rollback_internal_split(BPNode *left,
     bpnode_destroy(right);
 }
 
+/* 자식 노드 분할 결과를 종류에 맞춰 되돌린다. */
 static void rollback_child_split(BPNode *left_child,
                                  BPSplitResult *child_result) {
     if (!left_child || !child_result || !child_result->did_split ||
@@ -338,6 +382,7 @@ static void rollback_child_split(BPNode *left_child,
     child_result->right = NULL;
 }
 
+/* 삽입 중간 실패 시, 실제로 꽂아 넣은 키/offset도 재귀적으로 되돌린다. */
 static int rollback_insert(BPNode *node, int key, long offset) {
     if (!node) return -1;
 
@@ -370,6 +415,11 @@ static int rollback_insert(BPNode *node, int key, long offset) {
                            key, offset);
 }
 
+/*
+ * B+Tree 삽입의 재귀 본체다.
+ * 리프면 직접 삽입하고, 내부 노드면 자식에 내려가 삽입한 뒤
+ * 필요하면 자식 분할 결과를 현재 노드에 반영한다.
+ */
 static int bpnode_insert(BPTree *tree, BPNode *node,
                          int key, long offset, BPSplitResult *result) {
     result->did_split = 0;
@@ -446,6 +496,7 @@ static int bpnode_insert(BPTree *tree, BPNode *node,
     return 0;
 }
 
+/* 범위 결과용 동적 버퍼에 offset 하나를 추가한다. */
 static int range_buffer_push(BPRangeBuffer *buffer, long offset) {
     if (!buffer) return -1;
 
@@ -462,6 +513,7 @@ static int range_buffer_push(BPRangeBuffer *buffer, long offset) {
     return 0;
 }
 
+/* 루트부터 내려가 키가 속한 리프를 찾는다. 방문할 때마다 tree_io도 기록한다. */
 static BPNode *find_leaf(BPTree *tree, int key) {
     BPNode *node = tree ? tree->root : NULL;
 
@@ -475,11 +527,13 @@ static BPNode *find_leaf(BPTree *tree, int key) {
     return NULL;
 }
 
+/* 출력용 들여쓰기 헬퍼다. */
 static void print_indent(int depth) {
     for (int i = 0; i < depth; i++)
         printf("  ");
 }
 
+/* 디버깅용 트리 출력 함수의 재귀 본체다. */
 static void print_node(const BPNode *node, int depth) {
     if (!node) return;
 
@@ -505,6 +559,7 @@ static void print_node(const BPNode *node, int depth) {
         print_node(node->children[i], depth + 1);
 }
 
+/* 최소 order를 보정한 뒤, 비어 있는 leaf 하나를 가진 새 트리를 만든다. */
 BPTree *bptree_create(int order) {
     if (order < 3) order = 3;
 
@@ -523,12 +578,14 @@ BPTree *bptree_create(int order) {
     return tree;
 }
 
+/* 트리 전체 메모리를 해제한다. */
 void bptree_destroy(BPTree *tree) {
     if (!tree) return;
     bpnode_destroy(tree->root);
     free(tree);
 }
 
+/* 공개 insert 함수다. root split이 발생하면 새 root를 올린다. */
 int bptree_insert(BPTree *tree, int key, long value) {
     BPSplitResult result = {0, 0, NULL};
 
@@ -557,6 +614,7 @@ int bptree_insert(BPTree *tree, int key, long value) {
     return 0;
 }
 
+/* 단건 탐색: 키 하나를 찾아 해당 키의 첫 번째 offset을 돌려준다. */
 long bptree_search(BPTree *tree, int key) {
     BPNode *leaf = NULL;
     int pos = 0;
@@ -574,6 +632,11 @@ long bptree_search(BPTree *tree, int key) {
     return leaf->values[pos]->offsets[0];
 }
 
+/*
+ * 제한 없는 범위 탐색이다.
+ * from 이상인 첫 리프를 찾은 뒤, 리프 연결 리스트를 따라가며
+ * to 이하인 모든 키의 offset을 동적으로 모아 돌려준다.
+ */
 long *bptree_range_alloc(BPTree *tree, int from, int to, int *out_count) {
     BPNode *leaf = NULL;
     int pos = 0;
@@ -634,6 +697,7 @@ long *bptree_range_alloc(BPTree *tree, int from, int to, int *out_count) {
     return buffer.offsets;
 }
 
+/* 기존 제한형 range API는 제한 없는 결과를 받아 필요한 만큼만 복사한다. */
 int bptree_range(BPTree *tree, int from, int to, long *out, int max_count) {
     int count = 0;
     int copied = 0;
@@ -651,16 +715,19 @@ int bptree_range(BPTree *tree, int from, int to, long *out, int max_count) {
     return copied;
 }
 
+/* 현재 트리 높이를 돌려준다. */
 int bptree_height(BPTree *tree) {
     if (!tree) return 0;
     return tree->height;
 }
 
+/* 마지막 조회에서 기록한 노드 방문 수(tree_io)를 돌려준다. */
 int bptree_last_io(BPTree *tree) {
     if (!tree) return 0;
     return tree->last_io_count;
 }
 
+/* 디버깅용 공개 출력 함수다. */
 void bptree_print(BPTree *tree) {
     if (!tree || !tree->root) {
         printf("[bptree] NULL\n");
