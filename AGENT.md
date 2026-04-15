@@ -97,7 +97,10 @@ typedef struct {
 ### 4-2. bptree.h (A: 김용 소유)
 
 ```c
-// 단일 키 트리 (key=id, value=file_offset)
+// 단일 키 트리
+// Tree #1: key=id,  value=file_offset
+// Tree #2: key=age, value=file_offset
+// 동일한 BPTree API를 두 인스턴스에 각각 사용한다.
 BPTree *bptree_create(int order);
 void    bptree_destroy(BPTree *tree);
 int     bptree_insert(BPTree *tree, int key, long value);
@@ -106,13 +109,6 @@ int     bptree_range(BPTree *tree, int from, int to,
                      long *out, int max_count);
 int     bptree_height(BPTree *tree);
 void    bptree_print(BPTree *tree);
-
-// 복합 키 트리 (key1=id, key2=age)
-BPTreeComp *bptree_comp_create(int order);
-void        bptree_comp_destroy(BPTreeComp *tree);
-int         bptree_comp_insert(BPTreeComp *tree, int key1, int key2, long value);
-long        bptree_comp_search(BPTreeComp *tree, int key1, int key2); // 없으면 -1
-int         bptree_comp_height(BPTreeComp *tree);
 ```
 
 ### 4-3. index_manager.h (B: 김은재 소유)
