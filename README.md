@@ -1,138 +1,117 @@
 # SQL Parser with B+ Tree Index
 
-간단한 SQL 처리기에 B+ 트리 인덱스를 추가해 대용량 데이터에서의 SELECT/INSERT 성능을 비교한다.
+파일 기반 SQL 처리기에 B+ 트리 인덱스를 적용해, 선형 탐색(Full Table Scan)과의 성능 차이를 비교한 프로젝트입니다.
 
 ---
 
-## 팀 구성 및 담당
+## 1. B+ 트리 탐색
 
-| 역할 | 담당자 | 소유 파일 | 문서 |
-|------|--------|----------|------|
-| A — B+ Tree 알고리즘 | 김용 | `include/bptree.h`, `src/bptree/bptree.c` | [docs/role_A_김용.md](docs/role_A_김용.md) |
-| B — 인덱스 매니저 | 김은재 | `include/index_manager.h`, `src/index/index_manager.c` | [docs/role_B_김은재.md](docs/role_B_김은재.md) |
-| C — SQL 파서 확장 | 김규민 | `src/input/lexer.c`, `src/parser/parser.c`, `src/schema/schema.c` | [docs/role_C_김규민.md](docs/role_C_김규민.md) |
-| D — Executor + 성능 | 김원우 | `src/executor/executor.c`, `src/main.c` | [docs/role_D_김원우.md](docs/role_D_김원우.md) |
+![alt text](./docs/b+.png)
 
-**공유 파일 (수정 시 전원 합의 필요)**: `include/interface.h`, `Makefile`
+### 1-1. 선형탐색과 B+ 트리 비교
+
+![alt text](./docs/linearcheck.png)
+
+| 항목           | 🔍 선형 탐색 (Linear Scan)     | 🌳 B+ 트리                     |
+| -------------- | ------------------------------ | ------------------------------ |
+| 탐색 방식      | 파일 처음부터 끝까지 순차 탐색 | 루트 → 내부 노드 → 리프 노드   |
+| 접근 경로      | 전체 데이터 탐색               | 하나의 경로만 따라감           |
+| 비교 횟수      | 데이터 수에 비례 (O(N))        | 트리 높이에 비례 (O(log N))    |
+| 최악의 경우    | 거의 전체 파일을 읽음          | 항상 일정한 깊이만 탐색        |
+| 데이터 위치    | 파일 전체에 분산               | 실제 데이터는 리프 노드에 집중 |
+| 내부 노드 역할 | 없음                           | 다음으로 내려갈 child 선택     |
+| 성능 특징      | 데이터 많을수록 급격히 느려짐  | 데이터 많아도 안정적인 성능    |
 
 ---
 
-## 아키텍처
+## 2. B+ WHERE 조건 BETWEEN 로직
+
+`BETWEEN` 질의는 "시작 leaf를 찾고, 그 leaf부터 오른쪽으로 필요한 범위만 훑는 방식"으로 동작합니다.
+
+![img](./docs/between.png)
+
+1. 트리 탐색으로 `from`이 들어갈 **시작 리프**를 찾습니다.
+2. 그 리프 안에서 `from` 위치부터 순서대로 읽어 나갑니다.
+3. 리프를 다 소진하면 **옆 리프로 이동**합니다 (리프끼리 linked list로 연결).
+4. `to`를 넘는 key를 만나는 순간 **즉시 종료**합니다.
+5. 모은 offset 배열을 실행기가 받아 실제 row를 다시 읽는 과정이 발생합니다.
+
+### 2-1. 왜 B+ 트리에서 range 탐색이 유리한가?
+
+리프 내부는 이미 정렬되어 있고, 리프끼리 linked list로 이어져 있습니다. 그래서 범위 질의는 **처음 한 번만 트리를 탐색하고, 이후에는 리프 체인을 따라 순차적으로 훑는** 구조가 됩니다.
+
+| 구조                        | 특징                              | 성능           |
+| --------------------------- | --------------------------------- | -------------- |
+| 🔍 전체 파일 (Linear Scan)  | 디스크 전체 순차 탐색             | ❌ 매우 느림   |
+| 🌳 B+ 트리 (Node 내부 배열) | 작은 정렬된 배열 탐색             | ✅ 매우 빠름   |
+| 🔗 연결 리스트              | 포인터 따라 이동 (랜덤 접근 불가) | ❌ 캐시 비효율 |
+| 🌲 트리(포인터 기반 탐색)   | 노드 간 점프 발생                 | ⚠️ 캐시 비효율 |
 
 ```
-SQL 파일
-   │
-   ▼
-[Lexer] ──────── TOKEN_BETWEEN / TOKEN_AND 추가 (C: 김규민)
-   │
-   ▼
-[Parser] ─────── WHERE col BETWEEN a AND b 지원 (C: 김규민)
-   │
-   ▼
-[Schema] ─────── BETWEEN 컬럼 타입 검증 (C: 김규민)
-   │
-   ├──[INSERT]──▶ db_insert ──▶ 파일 append + B+ Tree 등록 (D: 김원우)
-   │                                    │
-   │                              [Index Manager] (B: 김은재)
-   │                                    │
-   │                             [B+ Tree #1: id]      (A: 김용)
-   │                             [B+ Tree #2: id,age]  (A: 김용)
-   │
-   └──[SELECT]──▶ db_select ──▶ WHERE id=?              → Tree #1 point search
-                                WHERE id BETWEEN a AND b → Tree #1 range search
-                                WHERE name=? 등          → 선형 스캔 (비교군)
-                                각 경로 실행 시간 + 트리 높이 출력 (D: 김원우)
-```
-
----
-
-## 빌드
-
-```bash
-make          # 기본 빌드 → ./sqlp
-make sim      # 디스크 I/O 시뮬레이션 빌드 → ./sqlp_sim
-make perf     # 성능 비교 실행 파일 → ./test_perf
-make perf_sim # 성능 비교 + I/O 시뮬레이션 → ./test_perf_sim
-make gen_data # 데이터 생성기 → ./gen_data
-make test     # 단위 테스트 실행
-make clean    # 빌드 결과물 삭제
+1. Node 하나는 크기가 작아 비교 범위가 제한됨
+2. 배열이라 메모리에 연속 -> CPU 캐시 히트율을 높임
+3. 정렬되어 있어 이진 탐색 가능(O(log N))
 ```
 
 ---
 
-## 실행
+## 3. 프로젝트 쟁점 포인트
 
-```bash
-# SQL 파일 실행
-./sqlp samples/insert.sql
+### 인덱스가 항상 최종 결과까지 빠른 것은 아니다
 
-# 대용량 데이터 생성 (100만 건)
-./gen_data 1000000 users
-./sqlp samples/bench_users.sql   # 삽입 실행
+- raw B+ 트리 탐색은 매우 빠릅니다.
+- 하지만 결과 row가 많아지면 `offset -> row 재조회` 비용이 커집니다.
+- 그래서 `age BETWEEN 30 AND 50` 같은 질의에서는 full scan이 더 효율적인 구간이 나타날 수 있습니다.
 
-# 성능 비교
-./test_perf
-./test_perf_sim   # I/O 시뮬레이션 포함
-```
+### 실제 높이 차이가 성능 효율에 영향을 줄까?
 
----
+- 메모리에서만 보면 트리 높이 차이가 체감되기 어렵습니다.
+  - `램 접근 비용은 거의 일정 (수십~수십ns)`
+- 노드 방문 시 랜덤 블록 읽기처럼 동작하는 시뮬레이션을 추가
+  - `높이가 변할 때마다 랜덤 파일 읽기를 수행`
+- 결론적으로 대략 1.5배 정도의 차이를 볼 수 있게 되었습니다.
 
-## 지원 SQL 문법
+### 최적의 최대 자식 수 선정
 
-```sql
-INSERT INTO users VALUES (1, 'alice', 25, 'alice@example.com');
-INSERT INTO users (id, name, age, email) VALUES (2, 'bob', 30, 'bob@example.com');
+- 디스크는 데이터를 읽을 때 요청한 크기와 무관하게 일정 단위(페이지)를 통째로 메모리에 올림
+- 따라서 `노드 하나의 크기를 페이지 크기에 맞추면` 노드 접근 1회 = 디스크 I/O 1회가 보장되어 낭비가 없음
 
-SELECT * FROM users;
-SELECT * FROM users WHERE id = 42;
-SELECT * FROM users WHERE name = 'alice';
-SELECT * FROM users WHERE id BETWEEN 100 AND 200;
-```
+하나의 (key, pointer) 쌍은 다음과 같이 구성된다.
 
----
+| 항목           | 크기         |
+| -------------- | ------------ |
+| key (int)      | 4 bytes      |
+| pointer (long) | 8 bytes      |
+| 합계           | **12 bytes** |
 
-## 스키마 (`schema/users.schema`)
+페이지 크기를 4096 bytes로 가정하면 노드에 담을 수 있는 최대 쌍의 수는 다음과 같다.
 
-```
-col0=id,INT,0         ← B+ Tree #1 인덱스 키
-col1=name,VARCHAR,64
-col2=age,INT,0        ← B+ Tree #2 복합 키 (id, age)
-col3=email,VARCHAR,128
-```
+M = 4096 / 12 = 341.3 → M = 341
 
----
+M = 341일 때 노드 크기는 341 × 12 = **4092 bytes**로, 페이지 낭비가 4 bytes에 불과하다.  
+이 값이 디스크 I/O 횟수를 최소화하는 **최적의 최대 자식 수**이다.
 
-## 성능 출력 예시
+## 4. 역할 분담
 
-```
-[SELECT][index:id:eq         ]    0.012 ms  tree_h(id)=4  tree_h(comp)=4
-[SELECT][index:id:range      ]    0.087 ms  tree_h(id)=4  tree_h(comp)=4
-[SELECT][linear              ]  342.110 ms  tree_h(id)=4  tree_h(comp)=4
-```
+각 역할이 독립 모듈을 맡되, 최종적으로는 하나의 SELECT 경로에서 만난다는 점을 강조하면 좋습니다.
 
-`make sim` 으로 빌드하면 레벨 이동마다 200µs sleep 이 추가되어 높이별 시간 차이가 명확해진다.
+| 역할 | 담당             | 발표에서 강조할 포인트                              |
+| ---- | ---------------- | --------------------------------------------------- |
+| A    | B+ Tree 알고리즘 | split, leaf linked list, range scan, tree height    |
+| B    | Index Manager    | `.dat` 파일 스캔, `id/age -> offset` 인덱스 구축    |
+| C    | SQL 파서 확장    | `BETWEEN` 문법과 타입 검증 추가                     |
+| D    | Executor + 성능  | 인덱스 분기, `fetch_by_offset(s)`, 시간 측정과 비교 |
+
+즉, 각 역할은 분리되어 있지만 실제 실행에서는 하나의 파이프라인으로 결합됩니다.
 
 ---
 
-## 파일 구조
+## 5. 발표 마무리
 
-```
-.
-├── include/
-│   ├── interface.h           ← 공유 계약 (전원 합의 필요)
-│   ├── bptree.h              ← A (김용)
-│   └── index_manager.h      ← B (김은재)
-├── src/
-│   ├── main.c                ← D (김원우)
-│   ├── bptree/bptree.c       ← A (김용)
-│   ├── index/index_manager.c ← B (김은재)
-│   ├── input/{input,lexer}.c ← C (김규민)
-│   ├── parser/parser.c       ← C (김규민)
-│   ├── schema/schema.c       ← C (김규민)
-│   └── executor/executor.c   ← D (김원우)
-├── tests/                    ← 공통 (공동 작업)
-├── tools/gen_data.c          ← 공통
-├── schema/users.schema
-├── docs/role_{A,B,C,D}_*.md
-└── Makefile
-```
+- 작은 범위의 point search / range search에서는 B+ 트리가 매우 효과적입니다.
+- 하지만 결과 row가 많아지면 실제 row fetch I/O 때문에 full scan이 더 유리해질 수 있습니다.
+- 이 프로젝트는 바로 그 차이를 "SQL 처리기 + 인덱스"를 통해 보여주기 위해 설계되었습니다.
+
+한 줄로 정리하면:
+
+> "이 프로젝트는 B+ 트리가 빠르다는 사실만 보여주는 것이 아니라, 언제 빠르고 언제 전체 실행에서는 불리해질 수 있는지까지 보여주는 SQL 처리기 확장 실험입니다."
