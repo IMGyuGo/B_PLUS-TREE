@@ -316,6 +316,20 @@ ResultSet *db_select(const SelectStmt *stmt, const TableSchema *schema) {
                 free(offsets);
             }
         }
+
+    } else if (stmt->has_where && strcmp(stmt->where.col, "age") == 0
+               && stmt->where.type == WHERE_BETWEEN) {
+        /* ── B+ Tree #2: age range search ── */
+        scan_type   = "index:age:range";
+        int   from    = atoi(stmt->where.val_from);
+        int   to      = atoi(stmt->where.val_to);
+        long *offsets = (long *)calloc(IDX_MAX_RANGE, sizeof(long));
+        if (offsets) {
+            int n = index_range_age(stmt->table, from, to,
+                                    offsets, IDX_MAX_RANGE);
+            rs = fetch_by_offsets(offsets, n, stmt, schema);
+            free(offsets);
+        }
     }
 
     /* 위 조건에 해당하지 않으면 선형 스캔 fallback */
@@ -326,10 +340,10 @@ ResultSet *db_select(const SelectStmt *stmt, const TableSchema *schema) {
 
     double elapsed = now_ms() - t0;
     fprintf(stderr,
-            "[SELECT][%-20s] %8.3f ms  tree_h(id)=%d  tree_h(comp)=%d\n",
+            "[SELECT][%-20s] %8.3f ms  tree_h(id)=%d  tree_h(age)=%d\n",
             scan_type, elapsed,
             index_height_id(stmt->table),
-            index_height_comp(stmt->table));
+            index_height_age(stmt->table));
 
     return rs;
 }
@@ -403,7 +417,7 @@ int db_insert(const InsertStmt *stmt, const TableSchema *schema) {
         int age = age_val ? atoi(age_val) : -1;
         index_insert_id(stmt->table, id, offset);
         if (age >= 0)
-            index_insert_comp(stmt->table, id, age, offset);
+            index_insert_age(stmt->table, age, offset);
     }
 
     return SQL_OK;

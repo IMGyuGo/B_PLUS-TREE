@@ -29,7 +29,14 @@
 #define DISK_IO_DELAY_US 200  /* 레벨당 200 µs */
 
 /* =========================================================
- * 단일 키 B+ Tree  (key: int,  value: long  파일 오프셋)
+ * 단일 키 B+ Tree  (key: int, value: long 파일 오프셋)
+ *
+ * 이 구현체는 두 인덱스 트리에 공통으로 사용된다.
+ *   - Tree #1: key=id
+ *   - Tree #2: key=age
+ *
+ * age 트리는 중복 key 를 가질 수 있으므로, 구현은 같은 key 에 대한
+ * 여러 엔트리를 안전하게 보관할 수 있어야 한다.
  * ========================================================= */
 typedef struct BPTree BPTree;
 
@@ -41,11 +48,20 @@ void    bptree_destroy(BPTree *tree);
 int  bptree_insert(BPTree *tree, int key, long value);
      /* 반환: 0 성공, -1 실패 */
 
-/* 탐색 */
+/* 탐색
+ * point search 는 주로 id 트리에 사용된다.
+ * 중복 key 가 있는 age 트리에서는 range search 가 기본 경로다.
+ */
 long bptree_search(BPTree *tree, int key);
      /* 반환: 파일 오프셋(≥0) 또는 -1(미발견) */
 
-/* 범위 탐색 (BETWEEN from AND to) */
+/* 범위 탐색 (BETWEEN from AND to)
+ * from <= key <= to 인 모든 엔트리의 오프셋을 out[] 에 저장한다.
+ * 같은 key 가 여러 번 등장하면 그 offset 도 모두 반환 대상이다.
+ * 반환 순서는 항상 다음 규칙을 따른다.
+ *   1. key 오름차순
+ *   2. 같은 key 안에서는 offset 오름차순
+ */
 int  bptree_range(BPTree *tree, int from, int to,
                   long *out, int max_count);
      /* 반환: 저장된 오프셋 개수. out 배열은 호출자가 할당한다. */
@@ -53,25 +69,5 @@ int  bptree_range(BPTree *tree, int from, int to,
 /* 정보 조회 */
 int  bptree_height(BPTree *tree);   /* 현재 트리 높이 */
 void bptree_print(BPTree *tree);    /* 디버그용 구조 출력 */
-
-/* =========================================================
- * 복합 키 B+ Tree  (key: (int id, int age),  value: long)
- * 키 비교 기준: key1(id) 먼저, 같으면 key2(age) 비교 (사전순)
- * ========================================================= */
-typedef struct BPTreeComp BPTreeComp;
-
-/* 생성 / 소멸 */
-BPTreeComp *bptree_comp_create(int order);
-void        bptree_comp_destroy(BPTreeComp *tree);
-
-/* 삽입 */
-int  bptree_comp_insert(BPTreeComp *tree, int key1, int key2, long value);
-
-/* 탐색 */
-long bptree_comp_search(BPTreeComp *tree, int key1, int key2);
-     /* 반환: 파일 오프셋(≥0) 또는 -1(미발견) */
-
-/* 정보 조회 */
-int  bptree_comp_height(BPTreeComp *tree);
 
 #endif /* BPTREE_H */

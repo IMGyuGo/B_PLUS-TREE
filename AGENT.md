@@ -61,12 +61,13 @@ SQL 파일
    │                                              │
    │                                    ┌─────────┴────────┐
    │                              [B+ Tree #1]       [B+ Tree #2]
-   │                              key=id             key=(id,age)
+   │                              key=id             key=age
    │                              A: 김용             A: 김용
    │
    └──[SELECT]──▶ executor.c::db_select    — D: 김원우
                       WHERE id=?              → index_search_id() + fetch_by_offset()
                       WHERE id BETWEEN a AND b → index_range_id() + fetch_by_offsets()
+                      WHERE age BETWEEN a AND b → index_range_age() + fetch_by_offsets()
                       그 외 (name=? 등)       → linear_scan()
                       (결과: stderr에 타이밍 출력)
 ```
@@ -96,7 +97,10 @@ typedef struct {
 ### 4-2. bptree.h (A: 김용 소유)
 
 ```c
-// 단일 키 트리 (key=id, value=file_offset)
+// 단일 키 트리
+// Tree #1: key=id,  value=file_offset
+// Tree #2: key=age, value=file_offset
+// 동일한 BPTree API를 두 인스턴스에 각각 사용한다.
 BPTree *bptree_create(int order);
 void    bptree_destroy(BPTree *tree);
 int     bptree_insert(BPTree *tree, int key, long value);
@@ -105,13 +109,6 @@ int     bptree_range(BPTree *tree, int from, int to,
                      long *out, int max_count);
 int     bptree_height(BPTree *tree);
 void    bptree_print(BPTree *tree);
-
-// 복합 키 트리 (key1=id, key2=age)
-BPTreeComp *bptree_comp_create(int order);
-void        bptree_comp_destroy(BPTreeComp *tree);
-int         bptree_comp_insert(BPTreeComp *tree, int key1, int key2, long value);
-long        bptree_comp_search(BPTreeComp *tree, int key1, int key2); // 없으면 -1
-int         bptree_comp_height(BPTreeComp *tree);
 ```
 
 ### 4-3. index_manager.h (B: 김은재 소유)
@@ -122,19 +119,22 @@ int         bptree_comp_height(BPTreeComp *tree);
 #define IDX_MAX_RANGE    65536
 #define IDX_MAX_TABLES       8
 
-int  index_init(const char *table, int order_id, int order_comp); /* 멱등 */
+int  index_init(const char *table, int order_id, int order_age); /* 멱등 */
 void index_cleanup(void);
 
+/* Tree #1 — id 단일 인덱스 */
 int  index_insert_id(const char *table, int id, long offset);
 long index_search_id(const char *table, int id);          /* 없으면 -1 */
 int  index_range_id(const char *table, int from, int to,
                     long *offsets, int max);
 
-int  index_insert_comp(const char *table, int id, int age, long offset);
-long index_search_comp(const char *table, int id, int age); /* 없으면 -1 */
+/* Tree #2 — age 단일 인덱스 (age는 유일하지 않으므로 range만 제공) */
+int  index_insert_age(const char *table, int age, long offset);
+int  index_range_age(const char *table, int from, int to,
+                     long *offsets, int max);
 
 int  index_height_id(const char *table);
-int  index_height_comp(const char *table);
+int  index_height_age(const char *table);
 ```
 
 ---
@@ -218,9 +218,9 @@ static double now_ms(void) {
 ### 6-5. 스키마 (schema/users.schema)
 
 ```
-col0=id,INT,0         ← B+ Tree #1 인덱스 키, B+ Tree #2 key1
+col0=id,INT,0         ← B+ Tree #1 인덱스 키
 col1=name,VARCHAR,64
-col2=age,INT,0        ← B+ Tree #2 key2
+col2=age,INT,0        ← B+ Tree #2 인덱스 키
 col3=email,VARCHAR,128
 ```
 
