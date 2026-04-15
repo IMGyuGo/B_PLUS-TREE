@@ -1,0 +1,6 @@
+table=users
+columns=4
+col0=student_no,INT,0
+col1=name,VARCHAR,64
+col2=gender,VARCHAR,10
+col3=is_cs_major,BOOLEAN,0
