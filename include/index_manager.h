@@ -32,13 +32,13 @@
  *   테이블의 인덱스를 초기화한다.
  *   이미 초기화된 테이블이면 즉시 성공을 반환한다 (멱등).
  *   내부적으로 data/{table}.dat 를 전체 스캔해
- *   Tree #1 (id) 과 Tree #2 (id, age) 를 구축한다.
+ *   Tree #1 (id) 과 Tree #2 (age) 를 구축한다.
  *
- *   order_id   : Tree #1 의 order (IDX_ORDER_DEFAULT 권장)
- *   order_comp : Tree #2 의 order (IDX_ORDER_DEFAULT 권장)
+ *   order_id  : Tree #1 의 order (IDX_ORDER_DEFAULT 권장)
+ *   order_age : Tree #2 의 order (IDX_ORDER_DEFAULT 권장)
  *   반환: 0 성공, -1 실패
  */
-int  index_init(const char *table, int order_id, int order_comp);
+int  index_init(const char *table, int order_id, int order_age);
 
 /* index_cleanup
  *   모든 테이블의 두 트리를 메모리에서 해제한다.
@@ -62,19 +62,23 @@ int  index_range_id(const char *table, int from, int to,
                     long *offsets, int max);
 
 /* =========================================================
- * Tree #2 — (id, age) 복합 인덱스
+ * Tree #2 — age 단일 인덱스
+ *   age 는 유일하지 않으므로 point search 대신 range search 만 제공한다.
+ *   WHERE age BETWEEN a AND b 쿼리를 인덱스로 처리한다.
  * ========================================================= */
 
-/* 삽입: (id, age, 파일 오프셋)을 Tree #2 에 추가한다. */
-int  index_insert_comp(const char *table, int id, int age, long offset);
+/* 삽입: (age, 파일 오프셋)을 Tree #2 에 추가한다. */
+int  index_insert_age(const char *table, int age, long offset);
 
-/* 탐색: (id, age) 에 해당하는 파일 오프셋을 반환한다. 없으면 -1. */
-long index_search_comp(const char *table, int id, int age);
+/* 범위 탐색: from <= age <= to 인 오프셋을 offsets[] 에 저장한다.
+ * 반환값: 저장된 개수. max 는 IDX_MAX_RANGE 이하로 지정한다. */
+int  index_range_age(const char *table, int from, int to,
+                     long *offsets, int max);
 
 /* =========================================================
  * 높이 조회 (성능 비교 출력용)
  * ========================================================= */
-int  index_height_id(const char *table);    /* Tree #1 현재 높이 */
-int  index_height_comp(const char *table);  /* Tree #2 현재 높이 */
+int  index_height_id(const char *table);   /* Tree #1 현재 높이 */
+int  index_height_age(const char *table);  /* Tree #2 현재 높이 */
 
 #endif /* INDEX_MANAGER_H */
